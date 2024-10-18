@@ -50,10 +50,6 @@ int xdp_prog(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
-		/* We only care about ARP requests */
-		if (bpf_ntohs(arp->ar_op) != ARPOP_REQUEST)
-			return XDP_PASS;
-
 		/* Reserve the packet to the ring buffer */
 		struct event *e;
 		e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -66,6 +62,7 @@ int xdp_prog(struct xdp_md *ctx)
 
 		e->ts = bpf_ktime_get_ns();
 		e->ifindex = ctx->ingress_ifindex;
+		e->ar_op = bpf_ntohs(arp->ar_op);
 		/* Copy fields from packet to the event struct */
 		memcpy(e->ar_sha, arp->ar_sha, sizeof(e->ar_sha));
 		memcpy(e->ar_sip, arp->ar_sip, sizeof(e->ar_sip));

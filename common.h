@@ -5,6 +5,7 @@
 struct event {
 	u_int64_t ts;		/* timestamp */
 	u_int32_t ifindex;	/* interface index */
+	u_int16_t ar_op;	/* ARP opcode */
 	u_int8_t ar_sha[6];	/* sender hardware address	*/
 	u_int8_t ar_sip[4];	/* sender IP address		*/
 	u_int8_t ar_tha[6];	/* target hardware address	*/

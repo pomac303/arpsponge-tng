@@ -7,6 +7,7 @@
 #include <time.h>
 #include <sys/resource.h>
 #include <getopt.h>
+#include <glib.h>
 #include <gmodule.h>
 
 #include <bpf/bpf.h>
@@ -51,6 +52,7 @@ typedef struct
 	u_int32_t sponge;
 	bool broadcast;
 	bool enabled;
+	bool verbose;
 	bool debug;
 	GList *cidr;
 } if_conf_t;
@@ -68,15 +70,25 @@ typedef struct
 	u_int64_t weight;
 	u_int64_t limit;
 	u_int64_t leak;
+	u_int32_t status_timer;
 	int sock;
 
 	GHashTable *interface;
 	GHashTable *store;
 } conf_t;
 
+typedef struct
+{
+	u_int64_t requests;
+	u_int64_t replies;
+} stat_counters_t;
+
 /* Global variables */
 static volatile bool exiting = false;
-conf_t conf = {0};
+static GTimer *status_timer = NULL;
+static conf_t conf = {0};
+static stat_counters_t stats = {0};
+
 
 #define MAKE4(x) (x[0] << 24 | x[1] << 16 | x[2] << 8 | x[3])
 
@@ -128,165 +140,196 @@ int
 handle_event(void *ctx, void *data, size_t data_sz)
 {
 	const struct event *e = data;
-	u_int32_t ipaddr = MAKE4(e->ar_tip);
 
-	store_data_t *entry = g_hash_table_lookup(conf.store, &ipaddr);
-
-	if (entry == NULL)
+	if (e->ar_op == ARPOP_REPLY)
 	{
-		entry = g_malloc0(sizeof(store_data_t));
-		entry->key = ipaddr;
-		entry->ts = e->ts;
-		entry->level = 0;
-		memcpy(entry->ip, e->ar_tip, sizeof(entry->ip));
-		g_hash_table_insert(conf.store, &entry->key, entry);
-	}
+		u_int32_t ipaddr = MAKE4(e->ar_sip);
+		store_data_t *entry = g_hash_table_lookup(conf.store, &ipaddr);
+		if (entry == NULL)
+			return 0;
 
-	if_conf_t *if_conf = g_hash_table_lookup(conf.interface, &e->ifindex);
-	if (if_conf == NULL)
-		print_and_leave("Problem looking up %u\n", e->ifindex);
-
-	int found = 0;
-	for (GList *list = if_conf->cidr; list != NULL; list = list->next)
-	{
-		cidr_t *cidr = list->data;
-		u_int32_t destip = MAKE4(e->ar_tip) & (0xffffffff << (32 - cidr->netmask));
-		if (cidr->value == destip)
+		if_conf_t *if_conf = g_hash_table_lookup(conf.interface, &e->ifindex);
+		if (if_conf == NULL)
+			return 0;
+		/*
+		if (memcmp(if_conf->hw_addr, e->ar_tha, ETH_ALEN))
 		{
-			found = 1;
-			break;
+
+			return 0;
 		}
+		*/
+		g_hash_table_remove(conf.store, &ipaddr);
 	}
-	if (!found)
-		fprintf(stderr, "Incorrect subnet for %d.%d.%d.%d\n", 
-				entry->ip[0], entry->ip[1], entry->ip[2], entry->ip[3]);
-
-	/* Leak from the bucket */
-	entry->level -= conf.leak * (e->ts - entry->ts);
-
-	/* Set the timestamp to current */
-	entry->ts = e->ts;
-
-	/* Handle underflows */
-	if (entry->level < 0)
-		entry->level = 0;
-
-	/* Add weight last to handle long time idle queries */
-	entry->level += conf.weight;
-
-	if (entry->level >= conf.limit) /* limit */
+	else if (e->ar_op == ARPOP_REQUEST)
 	{
-		struct tm *tm;
-		char ts[100];
-		time_t t;
+		u_int32_t ipaddr = MAKE4(e->ar_tip);
+		store_data_t *entry = g_hash_table_lookup(conf.store, &ipaddr);
 
-		time(&t);
-		tm = localtime(&t);
-		strftime(ts, sizeof(ts), "%c", tm);
-		printf("%-2s - weight: %li, sponging: %d.%d.%d.%d\n", 
-			ts, entry->level, entry->ip[0], entry->ip[1], entry->ip[2], entry->ip[3]);
-
-		entry->level = 0;
-
-		if (if_conf->debug)
-			printf("Would respond with: %02x:%02x:%02x:%02x:%02x:%02x\n", 
-				if_conf->hw_addr[0], if_conf->hw_addr[1], if_conf->hw_addr[2], 
-				if_conf->hw_addr[3], if_conf->hw_addr[4], if_conf->hw_addr[5]);
-
-		if (if_conf->sponge & TYPE_ALL)
+		stats.requests++;
+	
+		if (entry == NULL)
 		{
-			int bit = 1;
-			u_int32_t max_sponge = if_conf->sponge;
-			while (max_sponge)
+			entry = g_malloc0(sizeof(store_data_t));
+			entry->key = ipaddr;
+			entry->ts = e->ts;
+			entry->level = 0;
+			memcpy(entry->ip, e->ar_tip, sizeof(entry->ip));
+			g_hash_table_insert(conf.store, &entry->key, entry);
+		}
+	
+		if_conf_t *if_conf = g_hash_table_lookup(conf.interface, &e->ifindex);
+		if (if_conf == NULL)
+			print_and_leave("Problem looking up %u\n", e->ifindex);
+	
+		int found = 0;
+		for (GList *list = if_conf->cidr; list != NULL; list = list->next)
+		{
+			cidr_t *cidr = list->data;
+			u_int32_t destip = MAKE4(e->ar_tip) & (0xffffffff << (32 - cidr->netmask));
+			if (cidr->value == destip)
 			{
-				/* loop over any set bits, and process them with the same code */
-				u_int32_t sponge = max_sponge & 1 << bit;
-				if (if_conf->debug)
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			fprintf(stderr, "Incorrect subnet for %d.%d.%d.%d\n", 
+					entry->ip[0], entry->ip[1], entry->ip[2], entry->ip[3]);
+	
+		/* Leak from the bucket */
+		entry->level -= conf.leak * (e->ts - entry->ts);
+	
+		/* Set the timestamp to current */
+		entry->ts = e->ts;
+	
+		/* Handle underflows */
+		if (entry->level < 0)
+			entry->level = 0;
+	
+		/* Add weight last to handle long time idle queries */
+		entry->level += conf.weight;
+	
+		if (entry->level >= conf.limit) /* limit */
+		{
+			stats.replies++;
+	
+			if (if_conf->verbose)
+			{
+				struct tm *tm;
+				char ts[100];
+				time_t t;
+	
+				time(&t);
+				tm = localtime(&t);
+				strftime(ts, sizeof(ts), "%c", tm);
+				printf("[%-2s] weight: %li, sponging: %d.%d.%d.%d\n", 
+					ts, entry->level, entry->ip[0], entry->ip[1], entry->ip[2], entry->ip[3]);
+			}
+	
+			entry->level = 0;
+	
+			if (if_conf->debug)
+				printf("Would respond with: %02x:%02x:%02x:%02x:%02x:%02x\n", 
+					if_conf->hw_addr[0], if_conf->hw_addr[1], if_conf->hw_addr[2], 
+					if_conf->hw_addr[3], if_conf->hw_addr[4], if_conf->hw_addr[5]);
+	
+			if (if_conf->sponge & TYPE_ALL)
+			{
+				int bit = 1;
+				u_int32_t max_sponge = if_conf->sponge;
+	
+				while (max_sponge)
 				{
-					printf("--------------\ntype: %s%s%s\n", 
-							sponge & TYPE_REPLY ? "reply" : "", 
-							sponge & TYPE_REQUEST ? "request" : "",
-							sponge & TYPE_GRATUITOUS ? "gratuitous" : "");
+					/* loop over any set bits, and process them with the same code */
+					u_int32_t sponge = max_sponge & 1 << bit;
+	
+					if (if_conf->debug)
+					{
+						printf("--------------\ntype: %s%s%s\n", 
+								sponge & TYPE_REPLY ? "reply" : "", 
+								sponge & TYPE_REQUEST ? "request" : "",
+								sponge & TYPE_GRATUITOUS ? "gratuitous" : "");
+					}
+					max_sponge = max_sponge ^ sponge;
+					bit <<= 1;
+					
+					if (sponge == 0 )
+						continue;
+	
+					/*
+					 * From the arpsponge documentation:
+					 *
+					 * "reply"
+					 * Send an unsollicited unicast reply to IP-B:
+					 * ARP <IP-A> IS AT <MAC-A>
+					 *
+					 * Where IP-A and MAC-A are of the router targeted by the stray packet, 
+					 * and IP-B is the IP address of the neighbour whose cache needs to be updated.
+					 *
+					 * "request"
+					 * Send a unicast request by proxy (i.e. fake the requestor):
+					 * ARP WHO HAS <IP-B> TELL <IP-A>@<MAC-A>
+					 *
+					 * Where IP-B is the IP address of the neighbour whose cache needs to be updated.
+					 *
+					 * "gratuitous" reference: https://wiki.wireshark.org/Gratuitous_ARP
+					 * Send a unicast gratuitous ARP request on behalf of IP-A to IP-B:
+					 * ARP WHO HAS <IP-A> TELL <IP-A>@<MAC-A>
+					 *
+					 * Where IP-B is the IP address of the neighbour whose cache needs to be updated.
+					 *
+					 * Arpsponge specifies request and gratuitous as unicast, we support bot unicast
+					 * and broadcast.
+					 */
+	
+					struct sockaddr_ll sa;
+	
+					memset(&sa, 0, sizeof(sa));
+					sa.sll_family = AF_PACKET;
+					sa.sll_protocol = ETH_P_ARP;
+					sa.sll_ifindex = e->ifindex;
+					memcpy(sa.sll_addr, if_conf->hw_addr, ETH_ALEN);
+	
+					packet_t packet;
+	
+					if (if_conf->broadcast && sponge & (TYPE_REQUEST|TYPE_GRATUITOUS))
+						memset(packet.eth.ether_dhost, 0xff, ETH_ALEN);
+					else
+						memcpy(packet.eth.ether_dhost, e->ar_sha, ETH_ALEN);
+	
+					memcpy(packet.eth.ether_shost, sa.sll_addr, ETH_ALEN);
+					packet.eth.ether_type = ntohs(ETHERTYPE_ARP);
+	
+					packet.arp.ar_hrd = ntohs(ARPHRD_ETHER);
+					packet.arp.ar_pro = ntohs(ETH_P_IP);
+					packet.arp.ar_hln = ETH_ALEN;
+					packet.arp.ar_pln = 4;
+	
+					if (sponge & (TYPE_REPLY|TYPE_GRATUITOUS))
+						packet.arp.ar_op = ntohs(ARPOP_REPLY);
+					else	/* request */
+						packet.arp.ar_op = ntohs(ARPOP_REQUEST);
+	
+					memcpy(packet.arp.ar_sha, packet.eth.ether_shost, ETH_ALEN);
+					memcpy(packet.arp.ar_tha, packet.eth.ether_dhost, ETH_ALEN);
+					memcpy(packet.arp.ar_sip, e->ar_tip, 4);
+	
+					if (sponge & (TYPE_REPLY|TYPE_REQUEST))
+						memcpy(packet.arp.ar_tip, e->ar_sip, 4);
+					else
+						memcpy(packet.arp.ar_tip, e->ar_tip, 4);
+					
+					if (if_conf->debug)
+						print_raw_packet(&packet, sizeof(packet));
+	
+					if (if_conf->enabled)
+					{
+						if (sendto(conf.sock, &packet, sizeof(packet), 0, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+							fprintf(stderr, "Failed to send arp reply to \nn");
+					}
+					else if (if_conf->debug)
+						printf("Interface not enabled, no packet sent\n");
 				}
-				max_sponge = max_sponge ^ sponge;
-				bit <<= 1;
-				
-				if (sponge == 0 )
-					continue;
-
-				/*
-				 * From the arpsponge documentation:
-				 *
-				 * "reply"
-				 * Send an unsollicited unicast reply to IP-B:
-				 * ARP <IP-A> IS AT <MAC-A>
-				 *
-				 * Where IP-A and MAC-A are of the router targeted by the stray packet, 
-				 * and IP-B is the IP address of the neighbour whose cache needs to be updated.
-				 *
-				 * "request"
-				 * Send a unicast request by proxy (i.e. fake the requestor):
-				 * ARP WHO HAS <IP-B> TELL <IP-A>@<MAC-A>
-				 *
-				 * Where IP-B is the IP address of the neighbour whose cache needs to be updated.
-				 *
-				 * "gratuitous" reference: https://wiki.wireshark.org/Gratuitous_ARP
-				 * Send a unicast gratuitous ARP request on behalf of IP-A to IP-B:
-				 * ARP WHO HAS <IP-A> TELL <IP-A>@<MAC-A>
-				 *
-				 * Where IP-B is the IP address of the neighbour whose cache needs to be updated.
-				 *
-				 * Arpsponge specifies request and gratuitous as unicast, we support bot unicast
-				 * and broadcast.
-				 */
-
-				struct sockaddr_ll sa;
-
-				memset(&sa, 0, sizeof(sa));
-				sa.sll_family = AF_PACKET;
-				sa.sll_protocol = ETH_P_ARP;
-				sa.sll_ifindex = e->ifindex;
-				memcpy(sa.sll_addr, if_conf->hw_addr, ETH_ALEN);
-
-				packet_t packet;
-
-				if (if_conf->broadcast && sponge & (TYPE_REQUEST|TYPE_GRATUITOUS))
-					memset(packet.eth.ether_dhost, 0xff, ETH_ALEN);
-				else
-					memcpy(packet.eth.ether_dhost, e->ar_sha, ETH_ALEN);
-
-				memcpy(packet.eth.ether_shost, sa.sll_addr, ETH_ALEN);
-				packet.eth.ether_type = ntohs(ETHERTYPE_ARP);
-
-				packet.arp.ar_hrd = ntohs(ARPHRD_ETHER);
-				packet.arp.ar_pro = ntohs(ETH_P_IP);
-				packet.arp.ar_hln = ETH_ALEN;
-				packet.arp.ar_pln = 4;
-
-				if (sponge & (TYPE_REPLY|TYPE_GRATUITOUS))
-					packet.arp.ar_op = ntohs(ARPOP_REPLY);
-				else	/* request */
-					packet.arp.ar_op = ntohs(ARPOP_REQUEST);
-
-				memcpy(packet.arp.ar_sha, packet.eth.ether_shost, ETH_ALEN);
-				memcpy(packet.arp.ar_tha, packet.eth.ether_dhost, ETH_ALEN);
-				memcpy(packet.arp.ar_sip, e->ar_tip, 4);
-
-				if (sponge & (TYPE_REPLY|TYPE_REQUEST))
-					memcpy(packet.arp.ar_tip, e->ar_sip, 4);
-				else
-					memcpy(packet.arp.ar_tip, e->ar_tip, 4);
-				
-				if (if_conf->debug)
-					print_raw_packet(&packet, sizeof(packet));
-
-				if (if_conf->enabled)
-				{
-					if (sendto(conf.sock, &packet, sizeof(packet), 0, (struct sockaddr *)&sa, sizeof(sa)) < 0)
-						fprintf(stderr, "Failed to send arp reply to \nn");
-				}
-				else if (if_conf->debug)
-					printf("Interface not enabled, no packet sent\n");
 			}
 		}
 	}
@@ -320,6 +363,12 @@ load_conf(gchar *filename)
 				print_and_exit("Limit is 0? %s\n", error->message);
 			if ((conf.leak = g_key_file_get_uint64(key_file, groups[i], "leak", &error)) == 0)
 				print_and_exit("Leak is 0? %s\n", error->message);
+			if (g_key_file_has_key(key_file, groups[i], "status_timer", &error))
+			{
+				char *time = g_key_file_get_string(key_file, groups[i], "status_timer", &error);
+				conf.status_timer = atoi(time);
+				g_free(time);
+			}
 		}
 		else if (g_str_has_prefix(groups[i], "interface"))
 		{
@@ -381,6 +430,12 @@ load_conf(gchar *filename)
 				if_conf->debug = g_key_file_get_boolean(key_file, groups[i], "debug", &error);
 			else
 				if_conf->debug = FALSE;
+
+			/* verbose */
+			if (g_key_file_has_key(key_file, groups[i], "verbose", &error))
+				if_conf->verbose = g_key_file_get_boolean(key_file, groups[i], "verbose", &error);
+			else
+				if_conf->verbose = false;
 
 			/* insert in to hash table */
 			g_hash_table_insert(conf.interface, &if_conf->if_index, if_conf);
@@ -531,6 +586,12 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	if (conf.status_timer > 0)
+	{
+		printf("Status timer started with %us\n", conf.status_timer);
+		status_timer = g_timer_new();
+	}
+
 	printf("Successfully started! Please Ctrl+C to stop.\n");
 
 	/* Process events */
@@ -548,10 +609,32 @@ int main(int argc, char **argv)
 			printf("Error polling ring buffer: %d\n", err);
 			break;
 		}
+		if (status_timer && (int)g_timer_elapsed(status_timer, NULL) >= conf.status_timer)
+		{
+			struct tm *tm;
+			char ts[100];
+			time_t t;
+
+			time(&t);
+			tm = localtime(&t);
+			strftime(ts, sizeof(ts), "%c", tm);
+
+			/* print statistics */
+			printf("[%-2s] requests: %lu (%2.1f/s), replies: %lu (%2.1f/s), total size: %i\n", ts,
+					stats.requests, (float)stats.requests/conf.status_timer,
+					stats.replies, (float)stats.replies/conf.status_timer,
+					g_hash_table_size(conf.store));
+			stats.requests = 0;
+			stats.replies = 0;
+			/* restart timer */
+			g_timer_start(status_timer);
+		}
 	}
 
 cleanup:
 	close(conf.sock);
+
+	g_timer_destroy(status_timer);
 
 	/* Detach xdp program */
 	list_head = g_hash_table_get_keys(conf.interface);
