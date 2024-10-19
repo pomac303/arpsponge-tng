@@ -151,13 +151,7 @@ handle_event(void *ctx, void *data, size_t data_sz)
 		if_conf_t *if_conf = g_hash_table_lookup(conf.interface, &e->ifindex);
 		if (if_conf == NULL)
 			return 0;
-		/*
-		if (memcmp(if_conf->hw_addr, e->ar_tha, ETH_ALEN))
-		{
 
-			return 0;
-		}
-		*/
 		g_hash_table_remove(conf.store, &ipaddr);
 	}
 	else if (e->ar_op == ARPOP_REQUEST)
@@ -330,6 +324,8 @@ handle_event(void *ctx, void *data, size_t data_sz)
 					else if (if_conf->debug)
 						printf("Interface not enabled, no packet sent\n");
 				}
+				/* remove handled hosts */
+				g_hash_table_remove(conf.store, &ipaddr);
 			}
 		}
 	}
