@@ -14,7 +14,7 @@ $(BPFPROG): bobby.bpf.c
 $(BPFSKEL): $(BPFPROG)
 	bpftool gen skel $< > $(BPFSKEL)
 
-$(TARGET): bobby.c 
+$(TARGET): bobby.c $(BPFSKEL)
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $(TARGET)
 
 clean:
